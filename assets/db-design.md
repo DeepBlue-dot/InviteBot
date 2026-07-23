@@ -8,19 +8,23 @@ This document specifies the database architecture, entity relationships, indexes
 
 The GrowBot database is built on **PostgreSQL** and managed via **Prisma ORM**. It handles multi-tenant workspace management, Telegram bot webhooks, Mini App referral attribution, campaign lifecycle management, reward tracking, anti-cheat revocation, and community analytics.
 
-### Key Requirements Addressed
-1. **Telegram User Representation**: Unified `User` model for both Web Dashboard administrators and Telegram community members/referrers.
-2. **Workspace & Subscription Limits**: Multi-community administration with configurable workspace limits (`max_communities`, `max_campaigns`) to support future subscription plans (`FREE`, `PRO`).
-3. **Campaign Models**:
-   - `MILESTONE` ("Invite X friends to earn Reward")
-   - `LEADERBOARD` ("Top inviter(s) win competition")
-4. **5-Step Attribution & Anti-Cheat Flow**:
+### Key Architecture Refinements
+1. **Event-Driven Audit & Projection Architecture (`CampaignEvent`)**:
+   - Instead of mutating state directly on webhook events, every action produces an immutable `CampaignEvent` (e.g. `INTENT_CREATED`, `MEMBER_JOINED`, `REFERRAL_VALIDATED`, `REFERRAL_REVOKED`, `REWARD_EARNED`).
+   - Ensures an immutable audit log, simplified asynchronous analytics processing, and reliable event-sourcing.
+2. **Dedicated Validation Rules (`CampaignValidationRule`)**:
+   - Validation criteria are normalized into a dedicated `CampaignValidationRule` table linked to a `Campaign`.
+   - Allows multiple active validation rules per campaign (e.g. must stay in group for 24h AND send at least 1 message).
+3. **Advanced Anti-Cheat & Rejoin Metrics on `CommunityMember`**:
+   - Tracks `first_joined_at` and `rejoined_count` alongside `joined_at` and `left_at` to prevent leave-and-rejoin referral exploitation.
+4. **Telegram User Representation**: Unified `User` model for both Web Dashboard administrators and Telegram community members/referrers.
+5. **Workspace & Subscription Limits**: Multi-community administration with configurable workspace limits (`max_communities`, `max_campaigns`) supporting `FREE`, `PRO`, and `ENTERPRISE` plans.
+6. **5-Step Attribution & Anti-Cheat Flow**:
    - **Step 1 (Link Generation)**: Participant generates unique Mini App referral link (`t.me/GrowBotApp/app?startapp=ref_CODE`).
    - **Step 2 (Seamless Auth)**: Invitee opens Mini App; backend verifies `initDataRaw` HMAC-SHA256 signature.
    - **Step 3 (Intent Registration)**: Backend logs pending intent in Redis with 24h TTL (`pending_ref:{inviteeId}:{communityChatId}`).
    - **Step 4 (Direct Join)**: Invitee joins group/channel; Telegram dispatches `chat_member` webhook update to NestJS.
-   - **Step 5 (Verification & Credit / Anti-Cheat)**: Webhook verifies join against Redis, writes `Referral` to PostgreSQL, increments count, and deletes Redis key. If invitee leaves later (`status: left`), webhook automatically marks referral as `REVOKED` and decrements referral credit.
-5. **Customizable Validation Rules**: Support for `IMMEDIATE`, `TIME_BOUND` (staying N hours/days), and `MESSAGE_COUNT` (sending N messages).
+   - **Step 5 (Verification & Credit / Anti-Cheat)**: Webhook verifies join against Redis, writes `Referral` and `CampaignEvent` to PostgreSQL, increments count. If invitee leaves later (`status: left`), webhook marks referral as `REVOKED`, decrements credit, and logs a `REFERRAL_REVOKED` event.
 
 ---
 
@@ -34,6 +38,7 @@ erDiagram
     User ||--o{ Referral : "referred (as invitee)"
     User ||--o{ Reward : "earns"
     User ||--o{ CommunityMember : "belongs to community"
+    User ||--o{ CampaignEvent : "triggers"
 
     Workspace ||--o{ Community : "contains"
     
@@ -42,9 +47,14 @@ erDiagram
     Community ||--o{ CommunityDailyStat : "aggregates stats"
     Community ||--o{ TelegramEventLog : "logs events"
 
+    Campaign ||--o{ CampaignValidationRule : "has rules"
     Campaign ||--o{ CampaignParticipant : "has referrers"
     Campaign ||--o{ Referral : "tracks referrals"
     Campaign ||--o{ Reward : "issues rewards"
+    Campaign ||--o{ CampaignEvent : "generates events"
+
+    CampaignParticipant ||--o{ CampaignEvent : "produces"
+    Referral ||--o{ CampaignEvent : "records"
 ```
 
 ---
@@ -121,14 +131,27 @@ Referral campaigns configured by administrators for a community.
 | `start_date` | TimestampTZ | Not Null | Campaign start time |
 | `end_date` | TimestampTZ | Nullable | Optional campaign end time |
 | `status` | Enum | Not Null, default: `DRAFT` | `DRAFT`, `ACTIVE`, `PAUSED`, `COMPLETED`, `CANCELLED` |
-| `validation_rule` | Enum | Not Null, default: `IMMEDIATE` | `IMMEDIATE`, `TIME_BOUND`, `MESSAGE_COUNT` |
-| `validation_config` | JSONB | Not Null, default: `{}` | E.g. `{"min_hours": 24}` or `{"min_messages": 1}` |
 | `created_at` | TimestampTZ | Not Null, default: `now()` | Creation timestamp |
 | `updated_at` | TimestampTZ | Not Null, updated: `now()` | Last update timestamp |
 
 ---
 
-### 3.5 `CommunityMember` (`community_members`)
+### 3.5 `CampaignValidationRule` (`campaign_validation_rules`)
+Dedicated normalized table defining validation requirements for a referral.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID | PK, default: `uuid()` | Primary identifier |
+| `campaign_id` | UUID | FK -> `campaigns.id`, Not Null | Associated campaign |
+| `rule_type` | Enum | Not Null | `IMMEDIATE`, `TIME_BOUND`, `MESSAGE_COUNT` |
+| `config` | JSONB | Not Null, default: `{}` | E.g. `{"min_hours": 24}` or `{"min_messages": 1}` |
+| `is_active` | Boolean | Not Null, default: `true` | Rule toggle |
+| `created_at` | TimestampTZ | Not Null, default: `now()` | Creation timestamp |
+| `updated_at` | TimestampTZ | Not Null, updated: `now()` | Last modification timestamp |
+
+---
+
+### 3.6 `CommunityMember` (`community_members`)
 Membership state and activity metrics for Telegram users inside communities.
 
 | Column | Type | Constraints | Description |
@@ -139,15 +162,17 @@ Membership state and activity metrics for Telegram users inside communities.
 | `role` | Enum | Not Null, default: `MEMBER` | `MEMBER`, `ADMINISTRATOR`, `CREATOR` |
 | `status` | Enum | Not Null, default: `ACTIVE` | `ACTIVE`, `LEFT`, `KICKED`, `BANNED` |
 | `message_count` | Int | Not Null, default: `0` | Message count in group (for validation) |
-| `joined_at` | TimestampTZ | Not Null, default: `now()` | Join timestamp |
+| `first_joined_at` | TimestampTZ | Not Null, default: `now()` | First time user ever joined |
+| `joined_at` | TimestampTZ | Not Null, default: `now()` | Most recent join timestamp |
 | `left_at` | TimestampTZ | Nullable | Departure timestamp |
+| `rejoined_count` | Int | Not Null, default: `0` | Number of times user left & rejoined |
 | `last_active_at` | TimestampTZ | Nullable | Last message / activity timestamp |
 
 *Unique Index*: `(community_id, user_id)`
 
 ---
 
-### 3.6 `CampaignParticipant` (`campaign_participants`)
+### 3.7 `CampaignParticipant` (`campaign_participants`)
 Tracks members participating as referrers in a specific campaign.
 
 | Column | Type | Constraints | Description |
@@ -164,7 +189,7 @@ Tracks members participating as referrers in a specific campaign.
 
 ---
 
-### 3.7 `Referral` (`referrals`)
+### 3.8 `Referral` (`referrals`)
 Individual referral records linking a referrer to an invitee.
 
 | Column | Type | Constraints | Description |
@@ -184,7 +209,23 @@ Individual referral records linking a referrer to an invitee.
 
 ---
 
-### 3.8 `Reward` (`rewards`)
+### 3.9 `CampaignEvent` (`campaign_events`)
+Immutable event stream recording all campaign activities (clicks, intents, joins, validations, revocations, rewards).
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID | PK, default: `uuid()` | Primary identifier |
+| `campaign_id` | UUID | FK -> `campaigns.id`, Not Null | Associated campaign |
+| `participant_id` | UUID | FK -> `campaign_participants.id`, Nullable | Associated participant |
+| `user_id` | UUID | FK -> `users.id`, Nullable | User triggering or affected by event |
+| `referral_id` | UUID | FK -> `referrals.id`, Nullable | Associated referral record |
+| `event_type` | VarChar(64) | Not Null | E.g., `INTENT_CREATED`, `MEMBER_JOINED`, `REFERRAL_VALIDATED`, `REFERRAL_REVOKED`, `REWARD_EARNED` |
+| `metadata` | JSONB | Not Null, default: `{}` | Additional event payload details |
+| `created_at` | TimestampTZ | Not Null, default: `now()` | Event generation timestamp |
+
+---
+
+### 3.10 `Reward` (`rewards`)
 Records reward entitlements for referrers who achieve campaign targets or leaderboard rankings.
 
 | Column | Type | Constraints | Description |
@@ -200,7 +241,7 @@ Records reward entitlements for referrers who achieve campaign targets or leader
 
 ---
 
-### 3.9 `CommunityDailyStat` (`community_daily_stats`)
+### 3.11 `CommunityDailyStat` (`community_daily_stats`)
 Aggregated snapshot of community growth and referral performance for fast dashboard analytics rendering.
 
 | Column | Type | Constraints | Description |
@@ -218,7 +259,7 @@ Aggregated snapshot of community growth and referral performance for fast dashbo
 
 ---
 
-### 3.10 `TelegramEventLog` (`telegram_event_logs`)
+### 3.12 `TelegramEventLog` (`telegram_event_logs`)
 Raw audit and event processing log for Telegram webhook payloads.
 
 | Column | Type | Constraints | Description |
@@ -329,13 +370,14 @@ model User {
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
-  ownedWorkspaces      Workspace[]            @relation("WorkspaceOwner")
-  createdCampaigns     Campaign[]             @relation("CampaignCreator")
-  communityMemberships CommunityMember[]
+  ownedWorkspaces        Workspace[]            @relation("WorkspaceOwner")
+  createdCampaigns       Campaign[]             @relation("CampaignCreator")
+  communityMemberships   CommunityMember[]
   campaignParticipations CampaignParticipant[]
-  sentReferrals        Referral[]             @relation("Referrer")
-  receivedReferrals    Referral[]             @relation("Invitee")
-  rewards              Reward[]
+  sentReferrals          Referral[]             @relation("Referrer")
+  receivedReferrals      Referral[]             @relation("Invitee")
+  rewards                Reward[]
+  campaignEvents         CampaignEvent[]
 
   @@map("users")
   @@index([telegramId])
@@ -396,32 +438,49 @@ model Campaign {
   startDate         DateTime       @map("start_date") @db.Timestamptz
   endDate           DateTime?      @map("end_date") @db.Timestamptz
   status            CampaignStatus @default(DRAFT)
-  validationRule    ValidationRule @default(IMMEDIATE) @map("validation_rule")
-  validationConfig  Json           @default("{}") @map("validation_config") @db.JsonB
   createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz
   updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz
 
-  community    Community             @relation(fields: [communityId], references: [id], onDelete: Cascade)
-  createdBy    User                  @relation("CampaignCreator", fields: [createdById], references: [id])
-  participants CampaignParticipant[]
-  referrals    Referral[]
-  rewards      Reward[]
+  community       Community                @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  createdBy       User                     @relation("CampaignCreator", fields: [createdById], references: [id])
+  validationRules CampaignValidationRule[]
+  participants    CampaignParticipant[]
+  referrals       Referral[]
+  rewards         Reward[]
+  events          CampaignEvent[]
 
   @@map("campaigns")
   @@index([communityId])
   @@index([status])
 }
 
+model CampaignValidationRule {
+  id         String         @id @default(uuid()) @db.Uuid
+  campaignId String         @map("campaign_id") @db.Uuid
+  ruleType   ValidationRule @map("rule_type")
+  config     Json           @default("{}") @db.JsonB
+  isActive   Boolean        @default(true) @map("is_active")
+  createdAt  DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@map("campaign_validation_rules")
+  @@index([campaignId])
+}
+
 model CommunityMember {
-  id           String       @id @default(uuid()) @db.Uuid
-  communityId  String       @map("community_id") @db.Uuid
-  userId       String       @map("user_id") @db.Uuid
-  role         MemberRole   @default(MEMBER)
-  status       MemberStatus @default(ACTIVE)
-  messageCount Int          @default(0) @map("message_count")
-  joinedAt     DateTime     @default(now()) @map("joined_at") @db.Timestamptz
-  leftAt       DateTime?    @map("left_at") @db.Timestamptz
-  lastActiveAt DateTime?    @map("last_active_at") @db.Timestamptz
+  id            String       @id @default(uuid()) @db.Uuid
+  communityId   String       @map("community_id") @db.Uuid
+  userId        String       @map("user_id") @db.Uuid
+  role          MemberRole   @default(MEMBER)
+  status        MemberStatus @default(ACTIVE)
+  messageCount  Int          @default(0) @map("message_count")
+  firstJoinedAt DateTime     @default(now()) @map("first_joined_at") @db.Timestamptz
+  joinedAt      DateTime     @default(now()) @map("joined_at") @db.Timestamptz
+  leftAt        DateTime?    @map("left_at") @db.Timestamptz
+  rejoinedCount Int          @default(0) @map("rejoined_count")
+  lastActiveAt  DateTime?    @map("last_active_at") @db.Timestamptz
 
   community Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -441,8 +500,9 @@ model CampaignParticipant {
   validatedReferrals Int      @default(0) @map("validated_referrals")
   createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
 
-  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaign Campaign        @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events   CampaignEvent[]
 
   @@unique([campaignId, userId])
   @@map("campaign_participants")
@@ -461,14 +521,38 @@ model Referral {
   validatedAt       DateTime?      @map("validated_at") @db.Timestamptz
   revokedAt         DateTime?      @map("revoked_at") @db.Timestamptz
 
-  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  referrer User     @relation("Referrer", fields: [referrerId], references: [id], onDelete: Cascade)
-  invitee  User     @relation("Invitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+  campaign Campaign        @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  referrer User            @relation("Referrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  invitee  User            @relation("Invitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+  events   CampaignEvent[]
 
   @@unique([campaignId, inviteeId])
   @@map("referrals")
   @@index([campaignId, referrerId])
   @@index([status])
+}
+
+model CampaignEvent {
+  id            String    @id @default(uuid()) @db.Uuid
+  campaignId    String    @map("campaign_id") @db.Uuid
+  participantId String?   @map("participant_id") @db.Uuid
+  userId        String?   @map("user_id") @db.Uuid
+  referralId    String?   @map("referral_id") @db.Uuid
+  eventType     String    @map("event_type") @db.VarChar(64)
+  metadata      Json      @default("{}") @db.JsonB
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  campaign    Campaign             @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  participant CampaignParticipant? @relation(fields: [participantId], references: [id], onDelete: SetNull)
+  user        User?                @relation(fields: [userId], references: [id], onDelete: SetNull)
+  referral    Referral?            @relation(fields: [referralId], references: [id], onDelete: SetNull)
+
+  @@map("campaign_events")
+  @@index([campaignId])
+  @@index([participantId])
+  @@index([userId])
+  @@index([eventType])
+  @@index([createdAt])
 }
 
 model Reward {
@@ -523,7 +607,7 @@ model TelegramEventLog {
 
 ---
 
-## 5. 5-Step Mini App & Redis Attribution Integration
+## 5. 5-Step Mini App & Event-Driven Redis Attribution Integration
 
 1. **Step 1: Link Generation**
    - User A shares Mini App link: `https://t.me/GrowBotApp/app?startapp=ref_USER_A_CAMP1`.
@@ -534,28 +618,32 @@ model TelegramEventLog {
    - Frontend passes `initDataRaw` to NestJS.
    - NestJS verifies cryptographic HMAC-SHA256 signature to validate Invitee B's authentic Telegram ID.
 
-3. **Step 3: Intent Registration in Redis**
+3. **Step 3: Intent Registration in Redis & Event Dispatch**
    - Mini App shows: *"Welcome! You're invited to [Community Name]. Tap below to join."*
    - When Invitee B taps "Join Community", NestJS stores key in Redis (24-hour TTL):
      `pending_ref:{inviteeId}:{communityChatId}` -> `{ inviterId, campaignId, referralCode }`
+   - Dispatches a `CampaignEvent` of type `INTENT_CREATED`.
 
 4. **Step 4: Direct Join & Webhook Sync**
    - Invitee B joins the Telegram group/channel.
    - Telegram sends `chat_member` webhook update to NestJS (`new_chat_member.status === "member"`).
+   - NestJS updates or creates `CommunityMember` record, setting `first_joined_at` if new or incrementing `rejoined_count` if re-joining!
 
-5. **Step 5: Verification & Credit / Anti-Cheat Revocation**
+5. **Step 5: Verification & Credit / Anti-Cheat Revocation via Events**
    - Webhook checks Redis for `pending_ref:{inviteeId}:{communityChatId}`.
    - If found:
-     - Creates `Referral` in PostgreSQL with `status: PENDING_VALIDATION` or `VALIDATED`.
+     - Creates `Referral` in PostgreSQL (`status: PENDING_VALIDATION` or `VALIDATED`).
+     - Emits `CampaignEvent` of type `MEMBER_JOINED` and `REFERRAL_VALIDATED`.
      - Increments `validatedReferrals` on `CampaignParticipant` (if validation rule is immediate).
      - Removes Redis key.
-   - **Anti-Cheat Revocation**: If Invitee B leaves the group/channel later, Telegram sends a `chat_member` update (`status === "left"`). NestJS automatically marks referral as `REVOKED`, sets `revokedAt`, and decrements `validatedReferrals` on `CampaignParticipant`.
+   - **Anti-Cheat Revocation**: If Invitee B leaves the group/channel later, Telegram sends a `chat_member` update (`status === "left"`). NestJS marks referral as `REVOKED`, sets `revokedAt`, decrements `validatedReferrals` on `CampaignParticipant`, and emits a `CampaignEvent` of type `REFERRAL_REVOKED`.
 
 ---
 
 ## 6. Performance & Indexing Strategy
 
-1. **Leaderboard Queries**: Covered by `@@index([campaignId, validatedReferrals(sort: Desc)])` on `campaign_participants`.
-2. **Telegram Bot Lookups**: Covered by `@@unique([telegramChatId])` on `communities` and `@@unique([telegramId])` on `users`.
-3. **Webhook Join Processing**: Instant referral query via `@@unique([campaignId, inviteeId])`.
-4. **Daily Analytics Dashboards**: Aggregated snapshot query using `@@index([communityId, date(sort: Desc)])` on `community_daily_stats`.
+1. **Event Auditing & Event-Sourcing Queries**: Covered by `@@index([campaignId])`, `@@index([participantId])`, `@@index([eventType])`, and `@@index([createdAt])` on `campaign_events`.
+2. **Leaderboard Queries**: Covered by `@@index([campaignId, validatedReferrals(sort: Desc)])` on `campaign_participants`.
+3. **Telegram Bot Lookups**: Covered by `@@unique([telegramChatId])` on `communities` and `@@unique([telegramId])` on `users`.
+4. **Webhook Join Processing**: Instant referral query via `@@unique([campaignId, inviteeId])`.
+5. **Daily Analytics Dashboards**: Aggregated snapshot query using `@@index([communityId, date(sort: Desc)])` on `community_daily_stats`.
